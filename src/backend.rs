@@ -3,14 +3,16 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
+use async_trait::async_trait;
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError};
 use filesize::PathExt;
 
-use crate::background::BackgroundHandle;
+use crate::background::{BackgroundFuture, BackgroundHandle};
 use crate::compression::BackgroundCompactor;
-use crate::folder::{FileKind, FolderInfo, FolderScan};
+use crate::folder::{FileInfo, FileKind, FolderInfo, FolderScan, FutureFolderScan};
 use crate::gui::{GuiRequest, GuiWrapper};
 use crate::persistence::{config, pathdb};
+use std::sync::{Arc, Mutex};
 
 pub struct Backend<T> {
     gui: GuiWrapper<T>,
@@ -39,6 +41,10 @@ impl<T> Backend<T> {
     }
 
     pub fn run(&mut self) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         loop {
             match self.msg.recv() {
                 Ok(GuiRequest::ChooseFolder) => {
@@ -46,7 +52,8 @@ impl<T> Backend<T> {
 
                     if let Some(path) = path {
                         self.gui.folder(&path);
-                        self.scan_loop(path);
+                        runtime.block_on(self.scan_loop2(path));
+                        // self.scan_loop(path);
                     }
                 }
                 Ok(GuiRequest::Analyse) if self.info.is_some() => {
@@ -69,6 +76,41 @@ impl<T> Backend<T> {
                 }
             }
         }
+    }
+
+    async fn scan_loop2(&mut self, path: PathBuf) {
+        let excludes = config().read().unwrap().current().globset().expect("globs");
+
+        struct Reporter {
+            folder_info: Mutex<FolderInfo>,
+        }
+
+        #[async_trait]
+        impl BackgroundFuture for Reporter {
+            type Input = (FileInfo, FileKind);
+
+            async fn run(&self, (fi, kind): Self::Input) {
+                let mut info = self.folder_info.lock().unwrap();
+                info.push(kind, fi);
+            }
+        }
+
+        let start = Instant::now();
+        let reporter = Reporter {
+            folder_info: Mutex::new(FolderInfo::new(&path)),
+        };
+        let mut reporter = Arc::new(reporter);
+        let scanner = FutureFolderScan::new(path, excludes, reporter.clone());
+        scanner.run().await;
+        let info = Arc::get_mut(&mut reporter)
+            .unwrap()
+            .folder_info
+            .get_mut()
+            .unwrap();
+        self.gui
+            .status(format!("Scanned in {:.2?}", start.elapsed()), Some(1.0));
+        self.gui.summary(info.summary());
+        self.gui.scanned();
     }
 
     fn scan_loop(&mut self, path: PathBuf) {

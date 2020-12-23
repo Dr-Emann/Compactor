@@ -1,14 +1,19 @@
+use async_trait::async_trait;
 use crossbeam_channel::{Receiver, RecvTimeoutError, TryRecvError};
+use std::future::Future;
+use std::io::Read;
 use std::panic::{catch_unwind, UnwindSafe};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::task::{Context, Poll, Waker};
 use std::thread;
 /// Tiny thread-backed background job thing
 ///
 /// This is very similar to ffi_helper's Task
 /// https://github.com/Michael-F-Bryan/ffi_helpers
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct ControlToken<S>(Arc<ControlTokenInner<S>>);
@@ -181,6 +186,188 @@ pub trait Background: Send + Sync {
     type Status: Send + Sync;
 
     fn run(self, control: &ControlToken<Self::Status>) -> Self::Output;
+}
+
+pub struct FutureControlToken<S> {
+    status: Option<S>,
+}
+
+#[async_trait]
+pub trait BackgroundFuture {
+    type Input: Send;
+
+    async fn run(&self, input: Self::Input);
+}
+
+#[async_trait]
+impl<Inner: Send + Sync> BackgroundFuture for Arc<Inner>
+where
+    Inner: BackgroundFuture,
+{
+    type Input = Inner::Input;
+
+    async fn run(&self, input: Self::Input) {
+        (&**self).run(input).await
+    }
+}
+
+#[async_trait]
+impl<Inner: Send + Sync> BackgroundFuture for &Inner
+where
+    Inner: BackgroundFuture,
+{
+    type Input = Inner::Input;
+
+    async fn run(&self, input: Self::Input) {
+        (&**self).run(input).await
+    }
+}
+
+#[must_use = "yield_now does nothing unless polled/`await`-ed"]
+pub fn yield_now() -> impl Future<Output = ()> {
+    /// Yield implementation
+    struct YieldNow {
+        yielded: bool,
+    }
+
+    impl Future for YieldNow {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.yielded {
+                return Poll::Ready(());
+            }
+
+            self.yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    YieldNow { yielded: false }
+}
+
+struct PauseState {
+    paused: bool,
+    wakers: Vec<Waker>,
+}
+
+#[derive(Clone)]
+pub struct Pause(Arc<Mutex<PauseState>>);
+
+impl Pause {
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(PauseState {
+            paused: false,
+            wakers: Vec::new(),
+        })))
+    }
+
+    pub fn wrap<F: Send + Sync>(&self, f: F) -> PausableBackground<F>
+    where
+        F: BackgroundFuture,
+    {
+        PausableBackground {
+            pause: self.clone(),
+            inner: f,
+        }
+    }
+
+    pub fn wrap_future<F: Future + Unpin>(&self, f: F) -> impl Future<Output = F::Output> {
+        PauseFuture {
+            inner: f,
+            pause: self.clone(),
+        }
+    }
+}
+
+impl Pause {
+    pub fn pause(&self) {
+        let mut pause = self.0.lock().expect("pause lock");
+        pause.paused = true;
+    }
+
+    pub fn resume(&self) {
+        let mut pause = self.0.lock().expect("pause lock");
+        pause.paused = false;
+        for waker in pause.wakers.drain(..) {
+            waker.wake();
+        }
+    }
+
+    fn handle_pause(&self, waker: &Waker) -> bool {
+        let mut pause = self.0.lock().expect("pause lock");
+        if pause.paused {
+            pause.wakers.push(waker.clone());
+        }
+        pause.paused
+    }
+}
+
+struct PauseFuture<F> {
+    inner: F,
+    pause: Pause,
+}
+
+impl<F: Future + Unpin> Future for PauseFuture<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Scope to drop mutex before polling inner
+        if self.pause.handle_pause(cx.waker()) {
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.inner).poll(cx)
+    }
+}
+
+pub struct MultithreadedBackground<Inner> {
+    handle: tokio::runtime::Handle,
+    inner: Arc<Inner>,
+}
+
+impl<Inner: BackgroundFuture + Send + Sync + 'static> MultithreadedBackground<Inner> {
+    pub fn new(handle: tokio::runtime::Handle, inner: Inner) -> Self {
+        Self {
+            handle,
+            inner: Arc::new(inner),
+        }
+    }
+}
+
+#[async_trait]
+impl<Inner: Send + Sync + 'static> BackgroundFuture for MultithreadedBackground<Inner>
+where
+    Inner: BackgroundFuture,
+{
+    type Input = Inner::Input;
+
+    async fn run(&self, input: Self::Input) {
+        let inner = Arc::clone(&self.inner);
+        let _ = self
+            .handle
+            .spawn(async move {
+                inner.run(input).await;
+            })
+            .await;
+    }
+}
+
+pub struct PausableBackground<Inner> {
+    pause: Pause,
+    inner: Inner,
+}
+
+#[async_trait]
+impl<Inner: Send + Sync + 'static> BackgroundFuture for PausableBackground<Inner>
+where
+    Inner: BackgroundFuture,
+{
+    type Input = Inner::Input;
+
+    async fn run(&self, input: Self::Input) {
+        self.pause.wrap_future(self.inner.run(input)).await
+    }
 }
 
 #[cfg(test)]

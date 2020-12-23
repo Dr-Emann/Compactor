@@ -3,6 +3,7 @@ use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use filesize::PathExt;
 use globset::GlobSet;
 use serde_derive::Serialize;
@@ -12,8 +13,10 @@ use winapi::um::winnt::{
     FILE_ATTRIBUTE_TEMPORARY,
 };
 
-use crate::background::{Background, ControlToken};
+use crate::background::{yield_now, Background, BackgroundFuture, ControlToken};
 use crate::persistence::pathdb;
+use std::sync::Arc;
+use tokio::runtime::Handle;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FileInfo {
@@ -162,6 +165,97 @@ impl FolderScan {
             path: path.as_ref().to_path_buf(),
             excludes,
         }
+    }
+}
+
+pub struct FutureFolderScan<Next> {
+    path: PathBuf,
+    excludes: GlobSet,
+    next: Arc<Next>,
+}
+
+impl<Next: Send + Sync + 'static> FutureFolderScan<Next>
+where
+    Next: BackgroundFuture<Input = (FileInfo, FileKind)>,
+{
+    pub fn new(path: PathBuf, excludes: GlobSet, next: Next) -> Self {
+        Self {
+            path,
+            excludes,
+            next: Arc::new(next),
+        }
+    }
+
+    pub async fn run(self) {
+        let FutureFolderScan {
+            path,
+            excludes,
+            next,
+        } = self;
+
+        let mut tasks = Vec::new();
+
+        let incompressible = pathdb();
+        let mut incompressible = incompressible.write().unwrap();
+        let _ = incompressible.load();
+
+        // 1. Handle excludes separately for directories to allow pruning, while
+        //    still recording accurate sizes for files.
+        // 2. Ignore errors - consider recording them somewhere in future.
+        // 3. Only process files.
+        // 4. Grab metadata - should be infallible on Windows, it comes with the
+        //    DirEntry.
+        // 5. GetCompressedFileSizeW() or skip.
+        let walker = WalkDir::new(&path)
+            .into_iter()
+            .filter_entry(|e| e.file_type().is_file() || !excludes.is_match(e.path()))
+            .filter_map(|e| e.map_err(|e| eprintln!("Error: {:?}", e)).ok())
+            .filter(|e| e.file_type().is_file())
+            .filter_map(|e| e.metadata().map(|md| (e, md)).ok())
+            .filter_map(|(e, md)| e.path().size_on_disk().map(|s| (e, md, s)).ok());
+
+        for (entry, metadata, physical) in walker {
+            yield_now().await;
+
+            let shortname = entry
+                .path()
+                .strip_prefix(&path)
+                .unwrap_or_else(|_e| entry.path())
+                .to_path_buf();
+
+            let fi = FileInfo {
+                path: shortname,
+                logical_size: metadata.len().max(physical),
+                physical_size: physical,
+            };
+
+            let handle = Handle::current();
+            let next = Arc::clone(&next);
+            if fi.physical_size < fi.logical_size {
+                tasks.push(handle.spawn(async move {
+                    next.run((fi, FileKind::Compressed)).await;
+                }));
+            } else if fi.logical_size <= 4096
+                || metadata.file_attributes()
+                    & (FILE_ATTRIBUTE_READONLY
+                        | FILE_ATTRIBUTE_SYSTEM
+                        | FILE_ATTRIBUTE_TEMPORARY
+                        | FILE_ATTRIBUTE_COMPRESSED)
+                    != 0
+                || incompressible.contains(entry.path())
+                || excludes.is_match(entry.path())
+            {
+                tasks.push(handle.spawn(async move {
+                    next.run((fi, FileKind::Skipped)).await;
+                }));
+            } else {
+                tasks.push(handle.spawn(async move {
+                    next.run((fi, FileKind::Compressible)).await;
+                }));
+            }
+        }
+
+        futures::future::join_all(tasks).await;
     }
 }
 
