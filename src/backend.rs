@@ -76,18 +76,21 @@ impl<T> Backend<T> {
     fn scan_loop(&mut self, path: PathBuf) {
         let excludes = config().read().unwrap().current().globset().expect("globs");
 
-        let scanner = FolderScan::new(path, excludes);
+        let mut folder_info = FolderInfo::new(&path);
+        let mut last_path = PathBuf::from("None");
+
+        let (files_tx, files) = bounded(1);
+
+        let scanner = FolderScan::new(path, excludes, files_tx);
         let task = BackgroundHandle::spawn(scanner);
         let start = Instant::now();
 
         let mut paused = false;
         self.gui.status("Scanning", None);
+        let display = crossbeam_channel::tick(Duration::from_millis(50));
+        let never = crossbeam_channel::never();
         loop {
-            let display = if paused {
-                crossbeam_channel::never()
-            } else {
-                crossbeam_channel::after(Duration::from_millis(50))
-            };
+            let display = if paused { &never } else { &display };
             crossbeam_channel::select! {
                 recv(self.msg) -> msg => match msg {
                     Ok(GuiRequest::Pause) => {
@@ -109,48 +112,37 @@ impl<T> Backend<T> {
                         eprintln!("Ignored message: {:?}", msg);
                     }
                 },
-                recv(task.result_chan()) -> msg => match msg.unwrap() {
-                    Ok(Ok(info)) => {
-                        self.gui
-                            .status(format!("Scanned in {:.2?}", start.elapsed()), Some(1.0));
-                        self.gui.summary(info.summary());
-                        self.gui.scanned();
-                        self.info = Some(info);
-                        break;
-                    }
-                    Ok(Err(info)) => {
-                        self.gui.status(
-                            format!("Scan stopped after {:.2?}", start.elapsed()),
-                            Some(0.5),
-                        );
-                        self.gui.summary(info.summary());
-                        self.gui.stopped();
-                        self.info = Some(info);
-                        break;
-                    }
-                    Err(e) => {
-                        let err_str: &str;
-                        if let Some(s) = e.downcast_ref::<&str>() {
-                            err_str = s;
-                        } else if let Some(s) = e.downcast_ref::<String>() {
-                            err_str = s;
-                        } else {
-                            err_str = "Unknown error";
-                        }
-                        self.gui.status(format!("Error occurred: {}", err_str), Some(0.5));
-                        self.gui.stopped();
-                        break;
-                    }
+                recv(files) -> msg => match msg {
+                    Ok((fi, kind)) => {
+                        last_path.clone_from(&fi.path);
+                        folder_info.push(kind, fi);
+                    },
+                    Err(crossbeam_channel::RecvError) => break,
                 },
                 recv(display) -> _ => {
-                    if let Some(status) = task.status() {
-                        self.gui
-                            .status(format!("Scanning: {}", status.0.display()), None);
-                        self.gui.summary(status.1);
-                    }
+                    self.gui.status(format!("Scanning: {}", last_path.display()), None);
+                    self.gui.summary(folder_info.summary());
                 }
             }
         }
+
+        drop(files);
+        let cancelled = task.is_cancelled();
+        task.wait();
+
+        if !cancelled {
+            self.gui
+                .status(format!("Scanned in {:.2?}", start.elapsed()), Some(1.0));
+            self.gui.scanned();
+        } else {
+            self.gui.status(
+                format!("Scan stopped after {:.2?}", start.elapsed()),
+                Some(0.5),
+            );
+            self.gui.stopped();
+        }
+        self.gui.summary(folder_info.summary());
+        self.info = Some(folder_info);
     }
 
     // Ph'nglui mglw'nafh Cthulhu R'lyeh wgah'nagl fhtagn.

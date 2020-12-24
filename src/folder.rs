@@ -14,6 +14,7 @@ use winapi::um::winnt::{
 
 use crate::background::{Background, ControlToken};
 use crate::persistence::pathdb;
+use crossbeam_channel::Sender;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FileInfo {
@@ -154,29 +155,37 @@ impl GroupInfo {
 pub struct FolderScan {
     path: PathBuf,
     excludes: GlobSet,
+    output: Sender<(FileInfo, FileKind)>,
 }
 
 impl FolderScan {
-    pub fn new<P: AsRef<Path>>(path: P, excludes: GlobSet) -> Self {
+    pub fn new<P: AsRef<Path>>(
+        path: P,
+        excludes: GlobSet,
+        output: Sender<(FileInfo, FileKind)>,
+    ) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
             excludes,
+            output,
         }
     }
 }
 
 impl Background for FolderScan {
-    type Output = Result<FolderInfo, FolderInfo>;
-    type Status = (PathBuf, FolderSummary);
+    type Output = ();
+    type Status = ();
 
     fn run(self, control: &ControlToken<Self::Status>) -> Self::Output {
-        let FolderScan { path, excludes } = self;
-        let mut ds = FolderInfo::new(&path);
+        let FolderScan {
+            path,
+            excludes,
+            output,
+        } = self;
+
         let incompressible = pathdb();
         let mut incompressible = incompressible.write().unwrap();
         let _ = incompressible.load();
-
-        let mut last_status = Instant::now();
 
         // 1. Handle excludes separately for directories to allow pruning, while
         //    still recording accurate sizes for files.
@@ -209,17 +218,12 @@ impl Background for FolderScan {
 
             if count % 8 == 0 {
                 if control.is_cancelled_with_pause() {
-                    return Err(ds);
-                }
-
-                if last_status.elapsed() >= Duration::from_millis(50) {
-                    last_status = Instant::now();
-                    control.set_status((fi.path.clone(), ds.summary()));
+                    return;
                 }
             }
 
-            if fi.physical_size < fi.logical_size {
-                ds.push(FileKind::Compressed, fi);
+            let kind = if fi.physical_size < fi.logical_size {
+                FileKind::Compressed
             } else if fi.logical_size <= 4096
                 || metadata.file_attributes()
                     & (FILE_ATTRIBUTE_READONLY
@@ -230,13 +234,14 @@ impl Background for FolderScan {
                 || incompressible.contains(entry.path())
                 || excludes.is_match(entry.path())
             {
-                ds.push(FileKind::Skipped, fi);
+                FileKind::Skipped
             } else {
-                ds.push(FileKind::Compressible, fi);
+                FileKind::Compressible
+            };
+            if output.send((fi, kind)).is_err() {
+                return;
             }
         }
-
-        Ok(ds)
     }
 }
 
@@ -247,7 +252,8 @@ fn it_walks() {
     use crossbeam_channel::RecvTimeoutError;
 
     let gs = Config::default().globset().unwrap();
-    let scanner = FolderScan::new("C:\\Games", gs);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let scanner = FolderScan::new("C:\\Games", gs, tx);
 
     let task = BackgroundHandle::spawn(scanner);
 
@@ -258,8 +264,8 @@ fn it_walks() {
         match ret {
             Ok(ret) => {
                 // Unwrap thread result
-                let ret: Result<FolderInfo, FolderInfo> = ret.unwrap();
-                println!("Scanned: {:?}", ret);
+                ret.unwrap();
+                println!("Scanned: {} items", rx.len());
                 break;
             }
             Err(RecvTimeoutError::Timeout) => {
