@@ -9,7 +9,7 @@ use filesize::PathExt;
 
 use crate::background::BackgroundHandle;
 use crate::compression::BackgroundCompactor;
-use crate::folder::{FileKind, FolderInfo, FolderScan};
+use crate::folder::{FileInfo, FileKind, FolderInfo, FolderScan};
 use crate::gui::{GuiRequest, GuiWrapper};
 use crate::persistence::{config, pathdb};
 use std::collections::HashMap;
@@ -159,8 +159,19 @@ impl<T> Backend<T> {
         let (recv_result_tx, recv_result) = bounded::<(PathBuf, io::Result<bool>)>(1);
 
         let compression = Some(config().read().unwrap().current().compression);
-        let compactor = BackgroundCompactor::new(compression, send_file_rx, recv_result_tx);
-        let task = BackgroundHandle::spawn(compactor);
+
+        let tasks: Vec<BackgroundHandle<(), ()>> = (0..num_cpus::get())
+            .map(|_| {
+                let compactor = BackgroundCompactor::new(
+                    compression,
+                    send_file_rx.clone(),
+                    recv_result_tx.clone(),
+                );
+                BackgroundHandle::spawn(compactor)
+            })
+            .collect();
+        drop(send_file_rx);
+        drop(recv_result_tx);
         let start = Instant::now();
 
         let mut folder = self.info.take().expect("fileinfo");
@@ -181,9 +192,8 @@ impl<T> Backend<T> {
 
         self.gui.status("Compacting".to_string(), Some(0.0));
 
-        let mut file_infos = HashMap::new();
+        let mut file_infos: HashMap<PathBuf, FileInfo> = HashMap::new();
         let mut next_fi = folder.pop(FileKind::Compressible);
-        let mut last_path = PathBuf::from("None");
 
         let save_incompressible = crossbeam_channel::tick(Duration::from_secs(60));
         let display = crossbeam_channel::tick(Duration::from_millis(50));
@@ -225,8 +235,13 @@ impl<T> Backend<T> {
                         running = Some(());
                     }
                     Ok(GuiRequest::Stop) | Err(crossbeam_channel::RecvError) => {
+                        let last_path = file_infos
+                            .keys()
+                            .next()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "Unknown".into());
                         self.gui.status(
-                            format!("Stopping after {}", last_path.display()),
+                            format!("Stopping after {}", last_path),
                             Some(done as f32 / total as f32),
                         );
                         self.gui.stopped();
@@ -252,7 +267,6 @@ impl<T> Backend<T> {
                 let full_path = folder.path.join(&fi.path);
                 oper.send(send_file, (full_path.clone(), fi.logical_size))
                     .expect("Worker shouldn't quit until we send it everything");
-                last_path = fi.path.clone();
                 file_infos.insert(full_path, fi);
             } else if Some(oper_idx) == result_idx {
                 let (path, result) = match oper.recv(&recv_result) {
@@ -292,8 +306,13 @@ impl<T> Backend<T> {
                 let _ = incompressible.save();
             } else if Some(oper_idx) == display_idx {
                 let _ = oper.recv(&display);
+                let last_path = file_infos
+                    .keys()
+                    .next()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "Unknown".into());
                 self.gui.status(
-                    format!("Compacting: {}", last_path.display()),
+                    format!("Compacting: {}", last_path),
                     Some(done as f32 / total as f32),
                 );
                 self.gui.summary(folder.summary());
@@ -302,7 +321,9 @@ impl<T> Backend<T> {
 
         drop(send_file);
         drop(recv_result);
-        task.wait();
+        for task in tasks {
+            task.wait();
+        }
 
         let _ = incompressible.save();
 
@@ -329,8 +350,15 @@ impl<T> Backend<T> {
         let (send_file, send_file_rx) = bounded::<(PathBuf, u64)>(0);
         let (recv_result_tx, recv_result) = bounded::<(PathBuf, io::Result<bool>)>(1);
 
-        let compactor = BackgroundCompactor::new(None, send_file_rx, recv_result_tx);
-        let task = BackgroundHandle::spawn(compactor);
+        let tasks: Vec<BackgroundHandle<(), ()>> = (0..num_cpus::get())
+            .map(|_| {
+                let compactor =
+                    BackgroundCompactor::new(None, send_file_rx.clone(), recv_result_tx.clone());
+                BackgroundHandle::spawn(compactor)
+            })
+            .collect();
+        drop(send_file_rx);
+        drop(recv_result_tx);
         let start = Instant::now();
 
         let mut folder = self.info.take().expect("fileinfo");
@@ -451,7 +479,9 @@ impl<T> Backend<T> {
 
         drop(send_file);
         drop(recv_result);
-        task.wait();
+        for task in tasks {
+            task.wait();
+        }
 
         let new_size = folder.physical_size;
 
